@@ -1,0 +1,160 @@
+# 🐳 Docker Compose para SGP REA Productions - Desarrollo Local
+# Archivo: docker-compose.yml
+# Propósito: Configuración completa para desarrollo local sin servicios externos
+
+version: '3.8'
+
+services:
+  # Base de datos MySQL
+  mysql:
+    image: mysql:8.0
+    container_name: sgp_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rea_root_2025
+      MYSQL_DATABASE: sgp_rea_prod
+      MYSQL_USER: sgp_user
+      MYSQL_PASSWORD: sgp_pass_2025
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database_setup_mysql.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./mysql-config:/etc/mysql/conf.d
+    networks:
+      - sgp_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "sgp_user", "-psgp_pass_2025"]
+      timeout: 20s
+      retries: 10
+
+  # Base de datos MongoDB
+  mongodb:
+    image: mongo:7.0
+    container_name: sgp_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: rea_admin
+      MONGO_INITDB_ROOT_PASSWORD: rea_mongo_2025
+      MONGO_INITDB_DATABASE: sgp_rea_files
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./database_setup_mongodb.js:/docker-entrypoint-initdb.d/mongo-init.js
+    networks:
+      - sgp_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      timeout: 10s
+      retries: 10
+
+  # MongoDB Express - Interfaz web para MongoDB
+  mongo-express:
+    image: mongo-express:1.0.0
+    container_name: sgp_mongo_express
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: rea_admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: rea_mongo_2025
+      ME_CONFIG_MONGODB_URL: mongodb://rea_admin:rea_mongo_2025@mongodb:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+    depends_on:
+      - mongodb
+    networks:
+      - sgp_network
+
+  # PHPMyAdmin - Interfaz web para MySQL
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:5.2
+    container_name: sgp_phpmyadmin
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: sgp_user
+      PMA_PASSWORD: sgp_pass_2025
+      MYSQL_ROOT_PASSWORD: rea_root_2025
+    depends_on:
+      - mysql
+    networks:
+      - sgp_network
+
+  # Redis para cache y sesiones
+  redis:
+    image: redis:7.2-alpine
+    container_name: sgp_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass rea_cache_2025
+    volumes:
+      - redis_data:/data
+    networks:
+      - sgp_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "rea_cache_2025", "ping"]
+      timeout: 5s
+      retries: 5
+
+  # Servicio de archivos local (simula Google Cloud Storage)
+  minio:
+    image: minio/minio:latest
+    container_name: sgp_storage
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: rea_storage
+      MINIO_ROOT_PASSWORD: rea_storage_2025
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - sgp_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      timeout: 5s
+      retries: 5
+
+  # Mailhog - Servidor de email para desarrollo
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: sgp_mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    networks:
+      - sgp_network
+
+# Volúmenes persistentes
+volumes:
+  mysql_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+# Red interna
+networks:
+  sgp_network:
+    driver: bridge
+
+# Configuración de logging
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
