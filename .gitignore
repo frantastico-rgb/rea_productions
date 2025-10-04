@@ -1,0 +1,27 @@
+# Ignorar archivos de datos
+proyectos.json
+test_proyectos.json
+demo_proyectos.json
+
+# Ignorar archivos temporales
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+
+# Ignorar entornos virtuales
+venv/
+env/
+ENV/
+
+# Ignorar archivos del IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignorar archivos del sistema
+.DS_Store
+Thumbs.db
