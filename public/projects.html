@@ -338,6 +338,31 @@
     <script>
         const API_URL = 'http://localhost:3000/api';
 
+        // Verificar autenticación
+        async function checkAuth() {
+            try {
+                const response = await fetch(`${API_URL}/auth/check`);
+                const data = await response.json();
+                
+                if (!data.authenticated) {
+                    window.location.href = '/login.html';
+                    return false;
+                }
+                return true;
+            } catch (error) {
+                console.error('Error verificando autenticación:', error);
+                window.location.href = '/login.html';
+                return false;
+            }
+        }
+
+        // Iniciar aplicación
+        (async function() {
+            if (await checkAuth()) {
+                loadProjects();
+            }
+        })();
+
         // Auto-generar slug desde el título
         document.getElementById('title').addEventListener('input', function(e) {
             const slug = e.target.value
@@ -350,9 +375,6 @@
                 .trim();
             document.getElementById('slug').value = slug;
         });
-
-        // Cargar proyectos al inicio
-        loadProjects();
 
         // Manejar envío del formulario
         document.getElementById('projectForm').addEventListener('submit', async function(e) {

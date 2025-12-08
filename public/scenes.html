@@ -354,10 +354,30 @@
     <script>
         const API_URL = 'http://localhost:3000/api';
         
+        // Verificar autenticación
+        async function checkAuth() {
+            try {
+                const response = await fetch(`${API_URL}/auth/check`);
+                const data = await response.json();
+                
+                if (!data.authenticated) {
+                    window.location.href = '/login.html';
+                    return false;
+                }
+                return true;
+            } catch (error) {
+                console.error('Error verificando autenticación:', error);
+                window.location.href = '/login.html';
+                return false;
+            }
+        }
+        
         // Cargar escenas al iniciar
-        document.addEventListener('DOMContentLoaded', () => {
-            loadScripts();
-            loadScenes();
+        document.addEventListener('DOMContentLoaded', async () => {
+            if (await checkAuth()) {
+                loadScripts();
+                loadScenes();
+            }
         });
 
         // Cargar guiones para el dropdown

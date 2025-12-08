@@ -15,6 +15,8 @@ const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
 const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const session = require('express-session');
 
 // ===============================================
 // CONFIGURACIÓN INICIAL
@@ -68,6 +70,21 @@ if (NODE_ENV !== 'test') {
 // Parse JSON y URL encoded
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Configurar sesiones (debe estar ANTES de las rutas)
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'rea-productions-secret-key-change-in-production',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: false, // false para desarrollo (HTTP)
+        httpOnly: true,
+        maxAge: 1000 * 60 * 60 * 24 * 7, // 7 días
+        sameSite: 'lax'
+    }
+}));
+
+console.log('✅ Sistema de sesiones configurado');
 
 // Servir archivos estáticos desde la carpeta public
 app.use(express.static('public'));
@@ -490,11 +507,463 @@ app.get('/', (req, res) => {
 });
 
 // ===============================================
+// MIDDLEWARE DE AUTENTICACIÓN
+// ===============================================
+
+// Middleware para verificar autenticación
+function requireAuth(req, res, next) {
+    if (!req.session || !req.session.user) {
+        return res.status(401).json({ 
+            error: 'No autenticado',
+            message: 'Debe iniciar sesión para acceder a este recurso'
+        });
+    }
+    next();
+}
+
+// Middleware para verificar roles específicos
+function requireRole(allowedRoles) {
+    return (req, res, next) => {
+        if (!req.session || !req.session.user) {
+            return res.status(401).json({ 
+                error: 'No autenticado',
+                message: 'Debe iniciar sesión para acceder a este recurso'
+            });
+        }
+        
+        if (!allowedRoles.includes(req.session.user.role_name)) {
+            return res.status(403).json({ 
+                error: 'Acceso denegado',
+                message: `Necesita uno de estos roles: ${allowedRoles.join(', ')}`
+            });
+        }
+        
+        next();
+    };
+}
+
+// ===============================================
+// ENDPOINTS DE AUTENTICACIÓN
+// ===============================================
+
+// POST /api/auth/login - Iniciar sesión
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        
+        if (!username || !password) {
+            return res.status(400).json({ 
+                error: 'Datos incompletos',
+                message: 'Usuario y contraseña son requeridos'
+            });
+        }
+        
+        const pool = await getMySQLConnection();
+        
+        // Buscar usuario con su rol
+        const [users] = await pool.query(`
+            SELECT 
+                u.id,
+                u.username,
+                u.email,
+                u.password_hash,
+                u.first_name,
+                u.last_name,
+                CONCAT(u.first_name, ' ', u.last_name) as full_name,
+                u.role_id,
+                r.name as role_name,
+                r.display_name as role_display_name,
+                u.is_active,
+                u.created_at
+            FROM users u
+            INNER JOIN roles r ON u.role_id = r.id
+            WHERE u.username = ? AND u.is_active = 1
+            LIMIT 1
+        `, [username]);
+        
+        if (users.length === 0) {
+            return res.status(401).json({ 
+                error: 'Credenciales inválidas',
+                message: 'Usuario o contraseña incorrectos'
+            });
+        }
+        
+        const user = users[0];
+        
+        // Verificar contraseña
+        // Si el password_hash es null, es un usuario temporal sin contraseña
+        let passwordMatch = false;
+        
+        if (!user.password_hash) {
+            // Usuario sin contraseña - permitir acceso temporal (solo para desarrollo)
+            if (NODE_ENV === 'development') {
+                passwordMatch = true;
+                console.log('⚠️  ADVERTENCIA: Usuario sin contraseña detectado (solo desarrollo)');
+            }
+        } else {
+            passwordMatch = await bcrypt.compare(password, user.password_hash);
+        }
+        
+        if (!passwordMatch) {
+            return res.status(401).json({ 
+                error: 'Credenciales inválidas',
+                message: 'Usuario o contraseña incorrectos'
+            });
+        }
+        
+        // Crear sesión
+        req.session.user = {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            full_name: user.full_name,
+            role_id: user.role_id,
+            role_name: user.role_name,
+            role_display_name: user.role_display_name
+        };
+        
+        // Registrar login en logs
+        await logSystemEvent('info', 'user_login', `Usuario ${user.username} inició sesión`, {
+            user_id: user.id,
+            username: user.username,
+            role: user.role_name
+        });
+        
+        res.json({
+            success: true,
+            message: 'Sesión iniciada correctamente',
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                full_name: user.full_name,
+                role: {
+                    id: user.role_id,
+                    name: user.role_name,
+                    display_name: user.role_display_name
+                }
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error en login:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// POST /api/auth/logout - Cerrar sesión
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
+    try {
+        const username = req.session.user.username;
+        
+        req.session.destroy((err) => {
+            if (err) {
+                console.error('Error cerrando sesión:', err);
+                return res.status(500).json({
+                    error: 'Error cerrando sesión',
+                    message: err.message
+                });
+            }
+            
+            res.json({
+                success: true,
+                message: 'Sesión cerrada correctamente'
+            });
+        });
+        
+        // Log del logout (fuera del callback para no depender de la sesión)
+        await logSystemEvent('info', 'user_logout', `Usuario ${username} cerró sesión`, {
+            username: username
+        });
+        
+    } catch (error) {
+        console.error('Error en logout:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// GET /api/auth/me - Obtener usuario actual
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+    try {
+        res.json({
+            success: true,
+            user: req.session.user
+        });
+    } catch (error) {
+        console.error('Error obteniendo usuario actual:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// GET /api/auth/check - Verificar si hay sesión activa (sin requerir auth)
+app.get('/api/auth/check', (req, res) => {
+    res.json({
+        authenticated: !!(req.session && req.session.user),
+        user: req.session?.user || null
+    });
+});
+
+// ===============================================
+// GESTIÓN DE PROYECTOS
+// ===============================================
+
+// GET /api/projects - Listar proyectos
+app.get('/api/projects', requireAuth, async (req, res) => {
+    try {
+        const { status, limit = 20 } = req.query;
+        
+        const pool = await getMySQLConnection();
+        
+        let query = 'SELECT * FROM projects WHERE 1=1';
+        const params = [];
+        
+        if (status) {
+            query += ' AND status = ?';
+            params.push(status);
+        }
+        
+        query += ' ORDER BY created_at DESC LIMIT ?';
+        params.push(parseInt(limit));
+        
+        const [rows] = await pool.query(query, params);
+        
+        res.json({
+            success: true,
+            data: rows,
+            count: rows.length
+        });
+        
+    } catch (error) {
+        console.error('Error obteniendo proyectos:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// POST /api/projects - Crear nuevo proyecto
+app.post('/api/projects', requireAuth, async (req, res) => {
+    try {
+        const {
+            title,
+            slug,
+            description,
+            status,
+            genre,
+            target_duration,
+            budget_total,
+            start_date,
+            end_date
+        } = req.body;
+        
+        if (!title || !slug) {
+            return res.status(400).json({
+                error: 'Datos incompletos',
+                message: 'Título y slug son requeridos'
+            });
+        }
+        
+        const pool = await getMySQLConnection();
+        
+        const created_by = req.session.user.id;
+        
+        const [result] = await pool.query(`
+            INSERT INTO projects (
+                title, slug, description, status, genre, 
+                target_duration, budget_total, start_date, end_date, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            title, slug, description || null, status || 'desarrollo', genre || null,
+            target_duration || null, budget_total || null, start_date || null, 
+            end_date || null, created_by
+        ]);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Proyecto creado exitosamente',
+            data: {
+                id: result.insertId,
+                title,
+                slug
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error creando proyecto:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// GET /api/projects/:id - Ver proyecto individual
+app.get('/api/projects/:id', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const pool = await getMySQLConnection();
+        
+        // Obtener datos del proyecto
+        const [rows] = await pool.query(`
+            SELECT 
+                p.*,
+                CONCAT(u.first_name, ' ', u.last_name) as creator_name,
+                r.display_name as creator_role
+            FROM projects p
+            LEFT JOIN users u ON p.created_by = u.id
+            LEFT JOIN roles r ON u.role_id = r.id
+            WHERE p.id = ?
+            LIMIT 1
+        `, [id]);
+        
+        if (rows.length === 0) {
+            return res.status(404).json({ 
+                error: 'Proyecto no encontrado' 
+            });
+        }
+        
+        const project = rows[0];
+        
+        // Obtener estadísticas del proyecto
+        // Las escenas están relacionadas con scripts, no directamente con proyectos
+        const [scenesCount] = await pool.query(`
+            SELECT COUNT(DISTINCT sc.id) as count 
+            FROM scenes sc
+            INNER JOIN scripts s ON sc.script_id = s.id
+            WHERE s.project_id = ?
+        `, [id]);
+        
+        const [charactersCount] = await pool.query(
+            'SELECT COUNT(*) as count FROM characters WHERE project_id = ?',
+            [id]
+        );
+        
+        // Contar archivos en MongoDB
+        let filesCount = 0;
+        try {
+            const db = await getMongoConnection();
+            filesCount = await db.collection('projects_files').countDocuments({ project_id: parseInt(id) });
+        } catch (mongoError) {
+            console.warn('⚠️ No se pudo contar archivos de MongoDB:', mongoError.message);
+        }
+        
+        // Agregar estadísticas al proyecto
+        project.stats = {
+            scenes_count: scenesCount[0].count,
+            characters_count: charactersCount[0].count,
+            files_count: filesCount
+        };
+        
+        res.json({
+            success: true,
+            data: project
+        });
+        
+    } catch (error) {
+        console.error('❌ Error obteniendo proyecto:', error);
+        res.status(500).json({ 
+            error: 'Error obteniendo proyecto',
+            details: error.message 
+        });
+    }
+});
+
+// PUT /api/projects/:id - Actualizar proyecto
+app.put('/api/projects/:id', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updateData = req.body;
+        
+        const pool = await getMySQLConnection();
+        
+        const fields = [];
+        const values = [];
+        
+        Object.keys(updateData).forEach(key => {
+            if (key !== 'id' && updateData[key] !== undefined) {
+                fields.push(`${key} = ?`);
+                values.push(updateData[key]);
+            }
+        });
+        
+        if (fields.length === 0) {
+            return res.status(400).json({
+                error: 'No hay datos para actualizar'
+            });
+        }
+        
+        values.push(id);
+        
+        const [result] = await pool.query(
+            `UPDATE projects SET ${fields.join(', ')} WHERE id = ?`,
+            values
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                error: 'Proyecto no encontrado'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Proyecto actualizado exitosamente'
+        });
+        
+    } catch (error) {
+        console.error('Error actualizando proyecto:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// DELETE /api/projects/:id - Eliminar proyecto
+app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const pool = await getMySQLConnection();
+        
+        const [result] = await pool.query('DELETE FROM projects WHERE id = ?', [id]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                error: 'Proyecto no encontrado'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Proyecto eliminado exitosamente'
+        });
+        
+    } catch (error) {
+        console.error('Error eliminando proyecto:', error);
+        res.status(500).json({
+            error: 'Error interno del servidor',
+            message: error.message
+        });
+    }
+});
+
+// ===============================================
 // GESTIÓN DE GUIONES (SCRIPTS)
 // ===============================================
 
 // GET /api/scripts - Listar guiones
-app.get('/api/scripts', async (req, res) => {
+app.get('/api/scripts', requireAuth, async (req, res) => {
     try {
         const { project_id, is_current, limit = 50 } = req.query;
         
@@ -540,7 +1009,7 @@ app.get('/api/scripts', async (req, res) => {
 });
 
 // POST /api/scripts - Crear nuevo guión
-app.post('/api/scripts', async (req, res) => {
+app.post('/api/scripts', requireAuth, async (req, res) => {
     try {
         const {
             project_id,
@@ -622,7 +1091,7 @@ app.post('/api/scripts', async (req, res) => {
 });
 
 // PUT /api/scripts/:id - Actualizar guión
-app.put('/api/scripts/:id', async (req, res) => {
+app.put('/api/scripts/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
@@ -689,7 +1158,7 @@ app.put('/api/scripts/:id', async (req, res) => {
 });
 
 // DELETE /api/scripts/:id - Eliminar guión
-app.delete('/api/scripts/:id', async (req, res) => {
+app.delete('/api/scripts/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         
@@ -726,7 +1195,7 @@ app.delete('/api/scripts/:id', async (req, res) => {
 // ===============================================
 
 // GET /api/scenes - Listar escenas (con filtro opcional por script_id)
-app.get('/api/scenes', async (req, res) => {
+app.get('/api/scenes', requireAuth, async (req, res) => {
     try {
         const { script_id, status, limit = 50 } = req.query;
         
@@ -772,7 +1241,7 @@ app.get('/api/scenes', async (req, res) => {
 });
 
 // POST /api/scenes - Crear nueva escena
-app.post('/api/scenes', async (req, res) => {
+app.post('/api/scenes', requireAuth, async (req, res) => {
     try {
         const {
             script_id,
@@ -854,7 +1323,7 @@ app.post('/api/scenes', async (req, res) => {
 });
 
 // PUT /api/scenes/:id - Actualizar escena
-app.put('/api/scenes/:id', async (req, res) => {
+app.put('/api/scenes/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
@@ -921,7 +1390,7 @@ app.put('/api/scenes/:id', async (req, res) => {
 });
 
 // DELETE /api/scenes/:id - Eliminar escena
-app.delete('/api/scenes/:id', async (req, res) => {
+app.delete('/api/scenes/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         
