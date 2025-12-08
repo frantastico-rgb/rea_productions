@@ -14,6 +14,7 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
+const mysql = require('mysql2/promise');
 
 // ===============================================
 // CONFIGURACIÓN INICIAL
@@ -33,7 +34,7 @@ app.use(helmet({
         directives: {
             defaultSrc: ["'self'"],
             styleSrc: ["'self'", "'unsafe-inline'"],
-            scriptSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:", "https:"],
         },
     },
@@ -67,6 +68,9 @@ if (NODE_ENV !== 'test') {
 // Parse JSON y URL encoded
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Servir archivos estáticos desde la carpeta public
+app.use(express.static('public'));
 
 // ===============================================
 // CONEXIÓN A MONGODB
@@ -105,6 +109,44 @@ async function connectToMongoDB() {
     } catch (error) {
         console.error('❌ Error conectando a MongoDB:', error.message);
         isConnected = false;
+        throw error;
+    }
+}
+
+// ===============================================
+// CONEXIÓN A MYSQL
+// ===============================================
+
+let mysqlPool = null;
+
+async function getMySQLConnection() {
+    try {
+        if (!mysqlPool) {
+            mysqlPool = mysql.createPool({
+                host: process.env.MYSQL_HOST || 'localhost',
+                user: process.env.MYSQL_USER || 'root',
+                password: process.env.MYSQL_PASSWORD || '',
+                database: process.env.MYSQL_DATABASE || 'sgp_rea_prod',
+                port: process.env.MYSQL_PORT || 3306,
+                waitForConnections: true,
+                connectionLimit: 10,
+                queueLimit: 0,
+                enableKeepAlive: true,
+                keepAliveInitialDelay: 0
+            });
+            
+            console.log('✅ Pool de conexiones MySQL creado');
+            
+            // Probar la conexión
+            const connection = await mysqlPool.getConnection();
+            await connection.ping();
+            connection.release();
+            console.log('✅ MySQL conectado exitosamente');
+        }
+        
+        return mysqlPool;
+    } catch (error) {
+        console.error('❌ Error en conexión MySQL:', error.message);
         throw error;
     }
 }
@@ -445,6 +487,469 @@ app.get('/', (req, res) => {
         documentation: '/api/health',
         timestamp: new Date().toISOString()
     });
+});
+
+// ===============================================
+// GESTIÓN DE GUIONES (SCRIPTS)
+// ===============================================
+
+// GET /api/scripts - Listar guiones
+app.get('/api/scripts', async (req, res) => {
+    try {
+        const { project_id, is_current, limit = 50 } = req.query;
+        
+        const pool = await getMySQLConnection();
+        
+        let query = 'SELECT * FROM scripts WHERE 1=1';
+        const params = [];
+        
+        if (project_id) {
+            query += ' AND project_id = ?';
+            params.push(project_id);
+        }
+        
+        if (is_current !== undefined) {
+            query += ' AND is_current = ?';
+            params.push(is_current === 'true' || is_current === '1' ? 1 : 0);
+        }
+        
+        query += ' ORDER BY created_at DESC LIMIT ?';
+        params.push(parseInt(limit));
+        
+        const [rows] = await pool.query(query, params);
+        
+        await logSystemEvent('scripts_list', { 
+            count: rows.length,
+            filters: { project_id, is_current }
+        });
+        
+        res.json({
+            success: true,
+            data: rows,
+            count: rows.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Error obteniendo guiones:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al obtener los guiones',
+            details: error.message
+        });
+    }
+});
+
+// POST /api/scripts - Crear nuevo guión
+app.post('/api/scripts', async (req, res) => {
+    try {
+        const {
+            project_id,
+            title,
+            version,
+            file_path,
+            file_type,
+            file_size,
+            page_count,
+            scene_count,
+            is_current,
+            notes,
+            uploaded_by
+        } = req.body;
+        
+        // Validación básica
+        if (!project_id || !title) {
+            return res.status(400).json({
+                success: false,
+                error: 'project_id y title son campos requeridos'
+            });
+        }
+        
+        const pool = await getMySQLConnection();
+        
+        const cleanValue = (value) => value === undefined || value === '' || value === 'null' ? null : value;
+        
+        const query = `
+            INSERT INTO scripts (
+                project_id, title, version, file_path, file_type, 
+                file_size, page_count, scene_count, is_current, 
+                notes, uploaded_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        const params = [
+            project_id,
+            title,
+            cleanValue(version),
+            cleanValue(file_path),
+            cleanValue(file_type),
+            cleanValue(file_size),
+            cleanValue(page_count),
+            cleanValue(scene_count),
+            is_current === true || is_current === 1 ? 1 : 0,
+            cleanValue(notes),
+            cleanValue(uploaded_by) || 1
+        ];
+        
+        console.log('🔵 Creando guión con parámetros:', params);
+        
+        const [result] = await pool.query(query, params);
+        
+        // Obtener el guión recién creado
+        const [newScript] = await pool.query('SELECT * FROM scripts WHERE id = ?', [result.insertId]);
+        
+        await logSystemEvent('script_created', {
+            script_id: result.insertId,
+            project_id,
+            title
+        });
+        
+        console.log('✅ Guión creado exitosamente:', result.insertId);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Guión creado exitosamente',
+            data: newScript[0]
+        });
+        
+    } catch (error) {
+        console.error('❌ Error creando guión:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al crear el guión',
+            details: error.message
+        });
+    }
+});
+
+// PUT /api/scripts/:id - Actualizar guión
+app.put('/api/scripts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = req.body;
+        
+        const pool = await getMySQLConnection();
+        
+        // Construir query dinámicamente
+        const allowedFields = [
+            'project_id', 'title', 'version', 'file_path', 'file_type',
+            'file_size', 'page_count', 'scene_count', 'is_current',
+            'notes', 'uploaded_by'
+        ];
+        
+        const cleanValue = (value) => value === undefined || value === '' || value === 'null' ? null : value;
+        
+        const fields = [];
+        const values = [];
+        
+        for (const [key, value] of Object.entries(updates)) {
+            if (allowedFields.includes(key)) {
+                fields.push(`${key} = ?`);
+                values.push(key === 'is_current' ? (value === true || value === 1 ? 1 : 0) : cleanValue(value));
+            }
+        }
+        
+        if (fields.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'No hay campos válidos para actualizar'
+            });
+        }
+        
+        values.push(id);
+        
+        const query = `UPDATE scripts SET ${fields.join(', ')} WHERE id = ?`;
+        
+        const [result] = await pool.query(query, values);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Guión no encontrado'
+            });
+        }
+        
+        const [updatedScript] = await pool.query('SELECT * FROM scripts WHERE id = ?', [id]);
+        
+        await logSystemEvent('script_updated', { script_id: id, updates: Object.keys(updates) });
+        
+        res.json({
+            success: true,
+            message: 'Guión actualizado exitosamente',
+            data: updatedScript[0]
+        });
+        
+    } catch (error) {
+        console.error('❌ Error actualizando guión:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al actualizar el guión',
+            details: error.message
+        });
+    }
+});
+
+// DELETE /api/scripts/:id - Eliminar guión
+app.delete('/api/scripts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const pool = await getMySQLConnection();
+        
+        const [result] = await pool.query('DELETE FROM scripts WHERE id = ?', [id]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Guión no encontrado'
+            });
+        }
+        
+        await logSystemEvent('script_deleted', { script_id: id });
+        
+        res.json({
+            success: true,
+            message: 'Guión eliminado exitosamente'
+        });
+        
+    } catch (error) {
+        console.error('❌ Error eliminando guión:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al eliminar el guión',
+            details: error.message
+        });
+    }
+});
+
+// ===============================================
+// GESTIÓN DE ESCENAS (SCENES)
+// ===============================================
+
+// GET /api/scenes - Listar escenas (con filtro opcional por script_id)
+app.get('/api/scenes', async (req, res) => {
+    try {
+        const { script_id, status, limit = 50 } = req.query;
+        
+        const pool = await getMySQLConnection();
+        
+        let query = 'SELECT * FROM scenes WHERE 1=1';
+        const params = [];
+        
+        if (script_id) {
+            query += ' AND script_id = ?';
+            params.push(script_id);
+        }
+        
+        if (status) {
+            query += ' AND status = ?';
+            params.push(status);
+        }
+        
+        query += ' ORDER BY scene_number ASC LIMIT ?';
+        params.push(parseInt(limit));
+        
+        const [rows] = await pool.query(query, params);
+        
+        await logSystemEvent('scenes_list', { 
+            count: rows.length,
+            filters: { script_id, status }
+        });
+        
+        res.json({
+            success: true,
+            data: rows,
+            count: rows.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Error obteniendo escenas:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al obtener las escenas',
+            details: error.message
+        });
+    }
+});
+
+// POST /api/scenes - Crear nueva escena
+app.post('/api/scenes', async (req, res) => {
+    try {
+        const {
+            script_id,
+            scene_number,
+            scene_name,
+            location,
+            time_of_day,
+            description,
+            dialogue_count,
+            estimated_duration,
+            shooting_date,
+            status,
+            notes
+        } = req.body;
+        
+        // Validación básica
+        if (!script_id || !scene_number) {
+            return res.status(400).json({
+                success: false,
+                error: 'script_id y scene_number son campos requeridos'
+            });
+        }
+        
+        const pool = await getMySQLConnection();
+        
+        const cleanValue = (value) => value === undefined || value === '' || value === 'null' ? null : value;
+        
+        const query = `
+            INSERT INTO scenes (
+                script_id, scene_number, scene_name, location, time_of_day,
+                description, dialogue_count, estimated_duration, shooting_date,
+                status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        const params = [
+            script_id,
+            scene_number,
+            cleanValue(scene_name),
+            cleanValue(location),
+            cleanValue(time_of_day),
+            cleanValue(description),
+            dialogue_count || 0,
+            cleanValue(estimated_duration),
+            cleanValue(shooting_date),
+            status || 'pendiente',
+            cleanValue(notes)
+        ];
+        
+        console.log('🔵 Creando escena con parámetros:', params);
+        
+        const [result] = await pool.query(query, params);
+        
+        // Obtener la escena recién creada
+        const [newScene] = await pool.query('SELECT * FROM scenes WHERE id = ?', [result.insertId]);
+        
+        await logSystemEvent('scene_created', {
+            scene_id: result.insertId,
+            script_id,
+            scene_number
+        });
+        
+        console.log('✅ Escena creada exitosamente:', result.insertId);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Escena creada exitosamente',
+            data: newScene[0]
+        });
+        
+    } catch (error) {
+        console.error('❌ Error creando escena:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al crear la escena',
+            details: error.message
+        });
+    }
+});
+
+// PUT /api/scenes/:id - Actualizar escena
+app.put('/api/scenes/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = req.body;
+        
+        const pool = await getMySQLConnection();
+        
+        // Construir query dinámicamente
+        const allowedFields = [
+            'script_id', 'scene_number', 'scene_name', 'location', 'time_of_day',
+            'description', 'dialogue_count', 'estimated_duration', 'shooting_date',
+            'status', 'notes'
+        ];
+        
+        const cleanValue = (value) => value === undefined || value === '' || value === 'null' ? null : value;
+        
+        const fields = [];
+        const values = [];
+        
+        for (const [key, value] of Object.entries(updates)) {
+            if (allowedFields.includes(key)) {
+                fields.push(`${key} = ?`);
+                values.push(cleanValue(value));
+            }
+        }
+        
+        if (fields.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'No hay campos válidos para actualizar'
+            });
+        }
+        
+        values.push(id);
+        
+        const query = `UPDATE scenes SET ${fields.join(', ')} WHERE id = ?`;
+        
+        const [result] = await pool.query(query, values);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Escena no encontrada'
+            });
+        }
+        
+        const [updatedScene] = await pool.query('SELECT * FROM scenes WHERE id = ?', [id]);
+        
+        await logSystemEvent('scene_updated', { scene_id: id, updates: Object.keys(updates) });
+        
+        res.json({
+            success: true,
+            message: 'Escena actualizada exitosamente',
+            data: updatedScene[0]
+        });
+        
+    } catch (error) {
+        console.error('❌ Error actualizando escena:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al actualizar la escena',
+            details: error.message
+        });
+    }
+});
+
+// DELETE /api/scenes/:id - Eliminar escena
+app.delete('/api/scenes/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const pool = await getMySQLConnection();
+        
+        const [result] = await pool.query('DELETE FROM scenes WHERE id = ?', [id]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Escena no encontrada'
+            });
+        }
+        
+        await logSystemEvent('scene_deleted', { scene_id: id });
+        
+        res.json({
+            success: true,
+            message: 'Escena eliminada exitosamente'
+        });
+        
+    } catch (error) {
+        console.error('❌ Error eliminando escena:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error al eliminar escena'
+        });
+    }
 });
 
 // ===============================================
