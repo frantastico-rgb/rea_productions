@@ -14,7 +14,7 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const session = require('express-session');
 
@@ -131,39 +131,35 @@ async function connectToMongoDB() {
 }
 
 // ===============================================
-// CONEXIÓN A MYSQL
+// CONEXIÓN A POSTGRESQL
 // ===============================================
 
-let mysqlPool = null;
+let pgPool = null;
 
-async function getMySQLConnection() {
+async function getPostgreSQLConnection() {
     try {
-        if (!mysqlPool) {
-            mysqlPool = mysql.createPool({
-                host: process.env.MYSQL_HOST || 'localhost',
-                user: process.env.MYSQL_USER || 'root',
-                password: process.env.MYSQL_PASSWORD || '',
-                database: process.env.MYSQL_DATABASE || 'sgp_rea_prod',
-                port: process.env.MYSQL_PORT || 3306,
-                waitForConnections: true,
-                connectionLimit: 10,
-                queueLimit: 0,
-                enableKeepAlive: true,
-                keepAliveInitialDelay: 0
+        if (!pgPool) {
+            pgPool = new Pool({
+                connectionString: process.env.DATABASE_URL || 
+                    'postgresql://postgres:admin123@localhost:5432/sgp_rea_prod',
+                max: 10,
+                min: 2,
+                idleTimeoutMillis: 30000,
+                connectionTimeoutMillis: 10000,
             });
             
-            console.log('✅ Pool de conexiones MySQL creado');
+            console.log('✅ Pool de conexiones PostgreSQL creado');
             
             // Probar la conexión
-            const connection = await mysqlPool.getConnection();
-            await connection.ping();
-            connection.release();
-            console.log('✅ MySQL conectado exitosamente');
+            const client = await pgPool.connect();
+            await client.query('SELECT NOW()');
+            client.release();
+            console.log('✅ PostgreSQL conectado exitosamente');
         }
         
-        return mysqlPool;
+        return pgPool;
     } catch (error) {
-        console.error('❌ Error en conexión MySQL:', error.message);
+        console.error('❌ Error en conexión PostgreSQL:', error.message);
         throw error;
     }
 }
